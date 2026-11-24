@@ -32,8 +32,9 @@ class RemoteImages(private val fetch: suspend (String) -> ChatImageData?) {
 
     suspend fun original(id: String): RemoteImage? {
         val data = fetch(id) ?: return null
+        if (data.data.length !in 1..RemoteImageLimits.MAX_ENCODED_CHARS) return null
         val bytes = withContext(Dispatchers.Default) { runCatching { Base64.decode(data.data, Base64.DEFAULT) }.getOrNull() }
-        return bytes?.takeIf { it.isNotEmpty() }?.let { RemoteImage(it, data.format) }
+        return bytes?.takeIf { it.size in 1..RemoteImageLimits.MAX_BYTES }?.let { RemoteImage(it, data.format) }
     }
 
     companion object {
@@ -42,11 +43,14 @@ class RemoteImages(private val fetch: suspend (String) -> ChatImageData?) {
         val canSave: Boolean get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
 
         fun decode(bytes: ByteArray, edge: Int): Bitmap? {
+            if (bytes.size !in 1..RemoteImageLimits.MAX_BYTES) return null
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-            var sampleSize = 1
-            while (minOf(bounds.outWidth, bounds.outHeight) / (sampleSize * 2) >= edge) sampleSize *= 2
-            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sampleSize })
+            val sampleSize = RemoteImageLimits.sampleSize(bounds.outWidth, bounds.outHeight, edge) ?: return null
+            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            })
         }
 
         suspend fun save(context: Context, image: RemoteImage): Boolean = withContext(Dispatchers.IO) {

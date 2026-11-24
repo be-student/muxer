@@ -156,6 +156,7 @@ func (s *session) followTranscript(current *attachment, watch *chatWatch) {
 }
 
 func (s *session) sendChatSession(current *attachment, sessionID string) {
+	current.images.remember(nil, true)
 	var id any
 	if sessionID != "" {
 		id = sessionID
@@ -164,6 +165,7 @@ func (s *session) sendChatSession(current *attachment, sessionID string) {
 }
 
 func (s *session) sendChat(current *attachment, sessionID string, entries []chat.Entry, reset bool) {
+	current.images.remember(entries, reset)
 	if entries == nil {
 		entries = []chat.Entry{}
 	}
