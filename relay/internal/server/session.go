@@ -36,6 +36,7 @@ const (
 	maxImages            = 4
 	maxImageBytes        = 5 << 20
 	maxMessageBytes      = 32 << 20
+	maxPendingBytes      = 64 << 20
 )
 
 type requestError struct {
@@ -58,6 +59,7 @@ type attachment struct {
 	resync       atomic.Bool
 	lastActivity atomic.Int64
 	fitted       bool
+	images       attachedImages
 }
 
 type session struct {
@@ -75,6 +77,8 @@ type session struct {
 
 	parallelSlots chan struct{}
 	parallel      sync.WaitGroup
+	pendingBytes  atomic.Int64
+	messageFreed  chan struct{}
 }
 
 var parallelRequests = map[string]bool{
@@ -108,6 +112,7 @@ func newSession(server *Server, conn *websocket.Conn, device devices.Device) *se
 		device:        device,
 		clientID:      "muxer-" + device.ID,
 		parallelSlots: make(chan struct{}, maxParallelRequests),
+		messageFreed:  make(chan struct{}, 1),
 	}
 }
 
@@ -120,10 +125,9 @@ func (s *session) run() {
 	go s.watchRevocation()
 
 	for raw := range s.readMessages() {
-		if s.ctx.Err() != nil {
-			break
+		if s.ctx.Err() != nil || !s.handle(raw) {
+			s.releaseMessage(len(raw))
 		}
-		s.handle(raw)
 	}
 	s.detach()
 }
@@ -137,14 +141,43 @@ func (s *session) readMessages() <-chan json.RawMessage {
 			if err := wsjson.Read(s.ctx, s.conn, &raw); err != nil {
 				return
 			}
+			if !s.reserveMessage(len(raw)) {
+				return
+			}
 			select {
 			case messages <- raw:
 			case <-s.ctx.Done():
+				s.releaseMessage(len(raw))
 				return
 			}
 		}
 	}()
 	return messages
+}
+
+// Bound queued and executing request bodies together. The reader can also hold
+// one frame (at most maxMessageBytes) while waiting for this budget.
+func (s *session) reserveMessage(size int) bool {
+	for s.ctx.Err() == nil {
+		used := s.pendingBytes.Load()
+		if used+int64(size) <= maxPendingBytes && s.pendingBytes.CompareAndSwap(used, used+int64(size)) {
+			return true
+		}
+		select {
+		case <-s.messageFreed:
+		case <-s.ctx.Done():
+			return false
+		}
+	}
+	return false
+}
+
+func (s *session) releaseMessage(size int) {
+	s.pendingBytes.Add(-int64(size))
+	select {
+	case s.messageFreed <- struct{}{}:
+	default:
+	}
 }
 
 func (s *session) keepAlive() {
@@ -205,28 +238,31 @@ type envelope struct {
 	ID   string `json:"id"`
 }
 
-func (s *session) handle(raw json.RawMessage) {
+// handle reports whether a parallel request took ownership of the byte budget.
+func (s *session) handle(raw json.RawMessage) bool {
 	var message envelope
 	if err := json.Unmarshal(raw, &message); err != nil {
 		s.reply("", nil, &requestError{Code: "invalid_message", Message: "Messages must be JSON objects with a type."})
-		return
+		return false
 	}
 	current := s.current()
 	if !parallelRequests[message.Type] {
 		s.answer(message, raw, current)
-		return
+		return false
 	}
 	select {
 	case s.parallelSlots <- struct{}{}:
 	case <-s.ctx.Done():
-		return
+		return false
 	}
 	s.parallel.Add(1)
 	go func() {
 		defer s.parallel.Done()
 		defer func() { <-s.parallelSlots }()
+		defer s.releaseMessage(len(raw))
 		s.answer(message, raw, current)
 	}()
+	return true
 }
 
 func (s *session) answer(message envelope, raw json.RawMessage, current *attachment) {
@@ -551,13 +587,14 @@ func (s *session) dispatch(kind string, raw json.RawMessage, current *attachment
 		if err := json.Unmarshal(raw, &request); err != nil || request.Image == "" {
 			return nil, invalid("chat_image needs an image.")
 		}
-		if strings.HasPrefix(request.Image, "/") {
-			return readAttachedImage(request.Image)
-		}
 		var image cmux.ChatImage
 		err := s.withTerminal(current, func(current *attachment) error {
 			var err error
-			image, err = s.transcriptImage(ctx, current, request.Image)
+			if strings.HasPrefix(request.Image, "/") {
+				image, err = current.images.read(request.Image)
+			} else {
+				image, err = s.transcriptImage(ctx, current, request.Image)
+			}
 			return err
 		})
 		return image, err

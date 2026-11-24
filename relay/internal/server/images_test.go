@@ -3,13 +3,17 @@ package server
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/coder/websocket/wsjson"
+	"golang.org/x/sys/unix"
 
+	"github.com/gantoine/muxer/relay/internal/chat"
 	"github.com/gantoine/muxer/relay/internal/cmux"
 )
 
@@ -128,6 +132,21 @@ func TestPhoneCanFetchImagesFromTheChat(t *testing.T) {
 	if err := os.WriteFile(path, []byte("jpeg bytes"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	_ = wsjson.Write(ctx, conn, map[string]any{"type": "chat_image", "id": "before_attach", "image": path})
+	if result := resultFor(t, ctx, conn, "before_attach"); errorCode(result) != "not_attached" {
+		t.Fatalf("clipboard images need an attached conversation: %v", result)
+	}
+	transcript := filepath.Join(relay.claudeDir, "projects", "-Users-me-app", "s1.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line, _ := json.Marshal(map[string]any{"type": "user", "uuid": "u1", "message": map[string]any{"role": "user", "content": path + " what is this?"}})
+	if err := os.WriteFile(transcript, append(line, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	relay.cmux.setAgent(cmux.AgentSession{Kind: "claude", SessionID: "s1", Cwd: "/Users/me/app"})
+	_ = wsjson.Write(ctx, conn, map[string]any{"type": "attach", "workspace_id": "w1", "surface_id": "t1"})
+	readUntil(t, ctx, conn, "chat")
 	_ = wsjson.Write(ctx, conn, map[string]any{"type": "chat_image", "id": "2", "image": path})
 	result := resultFor(t, ctx, conn, "2")
 	data, _ := result["data"].(map[string]any)
@@ -137,14 +156,157 @@ func TestPhoneCanFetchImagesFromTheChat(t *testing.T) {
 
 	secret := filepath.Join(dir, "notes.txt")
 	_ = os.WriteFile(secret, []byte("private"), 0o600)
+	unannounced := filepath.Join(dir, "clipboard-2026-10-17-084701-00000001.jpeg")
+	_ = os.WriteFile(unannounced, []byte("not in this conversation"), 0o600)
 	for id, other := range map[string]string{
 		"3": secret,
 		"4": dir + "/x/../clipboard-2026-10-17-084701-6FFF738B.jpeg",
 		"5": filepath.Join(dir, "clipboard-2026-10-17-084701-00000000.jpeg"),
+		"6": unannounced,
 	} {
 		_ = wsjson.Write(ctx, conn, map[string]any{"type": "chat_image", "id": id, "image": other})
 		if result := resultFor(t, ctx, conn, id); result["ok"] == true {
 			t.Errorf("chat_image served %s: %v", other, result)
+		}
+	}
+	relay.cmux.setAgent(cmux.AgentSession{})
+	_ = wsjson.Write(ctx, conn, map[string]any{"type": "attach", "id": "switch", "workspace_id": "w1", "surface_id": "t2"})
+	resultFor(t, ctx, conn, "switch")
+	_ = wsjson.Write(ctx, conn, map[string]any{"type": "chat_image", "id": "old_attachment", "image": path})
+	if result := resultFor(t, ctx, conn, "old_attachment"); result["ok"] == true {
+		t.Fatalf("another attachment must not inherit image access: %v", result)
+	}
+}
+
+func TestAttachedImageIdentityAndBounds(t *testing.T) {
+	for _, change := range []string{"unchanged", "replace", "leaf_symlink", "parent_symlink", "fifo", "oversize"} {
+		t.Run(change, func(t *testing.T) {
+			dir := t.TempDir()
+			realDir := filepath.Join(dir, "real")
+			otherDir := filepath.Join(dir, "other")
+			for _, path := range []string{realDir, otherDir} {
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			alias := filepath.Join(dir, "alias")
+			if err := os.Symlink(realDir, alias); err != nil {
+				t.Fatal(err)
+			}
+			name := "clipboard-2026-10-17-084701-6FFF738B.jpeg"
+			path := filepath.Join(alias, name)
+			if err := os.WriteFile(path, []byte("announced"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var allowed attachedImages
+			allowed.remember([]chat.Entry{{Images: []string{path}}}, true)
+			switch change {
+			case "replace":
+				// Keep the original inode alive so this proves an identity change.
+				if err := os.Rename(path, filepath.Join(realDir, "old")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("different"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "leaf_symlink":
+				if err := os.Rename(path, filepath.Join(realDir, "old")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("old", path); err != nil {
+					t.Fatal(err)
+				}
+			case "parent_symlink":
+				if err := os.WriteFile(filepath.Join(otherDir, name), []byte("different"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(alias); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(otherDir, alias); err != nil {
+					t.Fatal(err)
+				}
+			case "fifo":
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := unix.Mkfifo(path, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "oversize":
+				if err := os.Truncate(path, maxImageBytes+1); err != nil {
+					t.Fatal(err)
+				}
+			}
+			image, err := allowed.read(path)
+			if change == "unchanged" {
+				if err != nil || image.Data != base64.StdEncoding.EncodeToString([]byte("announced")) {
+					t.Fatalf("an existing parent alias must work: image=%+v, err=%v", image, err)
+				}
+			} else if err == nil {
+				t.Fatalf("served %s file", change)
+			}
+		})
+	}
+}
+
+func TestAttachedImageReferencesExpireAndReset(t *testing.T) {
+	dir := t.TempDir()
+	var allowed attachedImages
+	var first, last string
+	for i := 0; i <= maxAttachedImageRefs; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("clipboard-2026-10-17-084701-%08x.png", i))
+		if err := os.WriteFile(path, []byte("image"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		allowed.remember([]chat.Entry{{Tool: &chat.Tool{Images: []string{path}}}}, false)
+		if i == 0 {
+			first = path
+		}
+		last = path
+	}
+	if _, err := allowed.read(first); err == nil {
+		t.Fatal("old reference was not evicted")
+	}
+	if _, err := allowed.read(last); err != nil {
+		t.Fatalf("new reference lost: %v", err)
+	}
+	allowed.remember([]chat.Entry{{Images: []string{first}}}, true)
+	if _, err := allowed.read(first); err != nil {
+		t.Fatalf("snapshot did not refresh history: %v", err)
+	}
+	if _, err := allowed.read(last); err == nil {
+		t.Fatal("reset kept a prior conversation's reference")
+	}
+}
+
+func TestImageValidationBoundsAndWrappedBase64(t *testing.T) {
+	maximum := base64.StdEncoding.EncodeToString(make([]byte, maxImageBytes))
+	images := make([]cmux.ChatImage, maxImages)
+	for i := range images {
+		images[i] = cmux.ChatImage{Data: maximum, Format: "png"}
+	}
+	if err := validImages(images); err != nil {
+		t.Fatalf("four maximum-size images must still work: %v", err)
+	}
+	for name, data := range map[string]string{
+		"maximum": maximum,
+		"wrapped": maximum[:80] + "\r\n" + maximum[80:] + "\n",
+	} {
+		if err := validImages([]cmux.ChatImage{{Data: data, Format: "png"}}); err != nil {
+			t.Errorf("%s rejected: %v", name, err)
+		}
+	}
+	for name, data := range map[string]string{
+		"one_byte_over":      base64.StdEncoding.EncodeToString(make([]byte, maxImageBytes+1)),
+		"encoded_over":       strings.Repeat("A", base64.StdEncoding.EncodedLen(maxImageBytes)+4),
+		"invalid_tail":       base64.StdEncoding.EncodeToString([]byte("image")) + "!",
+		"data_after_padding": "YQ==YQ==",
+		"missing_padding":    "YQ",
+		"empty":              "\r\n",
+	} {
+		if err := validImages([]cmux.ChatImage{{Data: data, Format: "png"}}); err == nil {
+			t.Errorf("%s accepted", name)
 		}
 	}
 }

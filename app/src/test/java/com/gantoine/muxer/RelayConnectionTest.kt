@@ -2,8 +2,10 @@ package com.gantoine.muxer
 
 import com.gantoine.muxer.net.ConnectionState
 import com.gantoine.muxer.net.PairingClient
+import com.gantoine.muxer.net.RelayConnection
 import com.gantoine.muxer.protocol.RelayNotification
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -111,6 +113,87 @@ class RelayConnectionTest {
         assertNull(connection.screen.value)
         assertNull(connection.inputState.value)
         connection.stop()
+    }
+
+    @Test
+    fun notificationQueueOverflowReconnectsAndReplaysWithoutSkippingEvents() = runBlocking {
+        assertNotificationReplayAfterOverflow(eventCount = 200, bodyLength = 1)
+    }
+
+    @Test
+    fun notificationCharacterBudgetIncludesTheActiveDelivery() = runBlocking {
+        assertNotificationReplayAfterOverflow(eventCount = 2, bodyLength = 300 * 1024)
+    }
+
+    private suspend fun assertNotificationReplayAfterOverflow(eventCount: Int, bodyLength: Int) {
+        val firstSocket = CompletableDeferred<WebSocket>()
+        val enteredDelivery = CompletableDeferred<Unit>()
+        val resumeDelivery = CompletableDeferred<Unit>()
+        val replayAfter = CompletableDeferred<Long>()
+        val lastDelivered = AtomicLong(1)
+        val delivered = CopyOnWriteArrayList<Long>()
+        val body = "x".repeat(bodyLength)
+        fun event(seq: Long) = """{"type":"notification","notification":{"seq":$seq,"kind":"created","id":"n$seq","body":"$body"}}"""
+        for (attempt in 0..1) {
+            server.enqueue(MockResponse.Builder().webSocketUpgrade(object : WebSocketListener() {
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    val message = Json.parseToJsonElement(text).jsonObject
+                    if (message["type"]?.jsonPrimitive?.content != "hello") return
+                    val after = message.getValue("notifications_after").jsonPrimitive.content.toLong()
+                    webSocket.send(FakeRelay.welcome(message["id"]?.jsonPrimitive?.content, notificationSeq = 1))
+                    if (attempt == 0) {
+                        firstSocket.complete(webSocket)
+                    } else {
+                        replayAfter.complete(after)
+                        for (seq in (after + 1)..(eventCount + 1L)) webSocket.send(event(seq))
+                    }
+                    webSocket.send("""{"type":"approvals","approvals":[{"id":"r1","kind":"permission","workspace_id":"w1","surface_id":"t1","tool":"Bash"}]}""")
+                }
+
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    webSocket.close(code, null)
+                }
+            }).build())
+        }
+        val connection = RelayConnection(
+            macId = "mac",
+            baseUrl = server.url("/").toString().trimEnd('/'),
+            token = "secret-token",
+            client = client,
+            scope = scope,
+            notificationsAfter = { lastDelivered.get() },
+            onNotification = { _, notification ->
+                if (notification.seq == 2L) {
+                    enteredDelivery.complete(Unit)
+                    resumeDelivery.await()
+                }
+                if (notification.seq > lastDelivered.get()) {
+                    delivered += notification.seq
+                    lastDelivered.set(notification.seq)
+                }
+            },
+        )
+        try {
+            connection.start()
+            val relay = withTimeout(5_000) { firstSocket.await() }
+            relay.send(event(2))
+            withTimeout(5_000) { enteredDelivery.await() }
+            for (seq in 3L..(eventCount + 1L)) relay.send(event(seq))
+            val disconnected = withTimeout(5_000) { connection.state.first { it is ConnectionState.Disconnected } }
+            assertTrue((disconnected as ConnectionState.Disconnected).reason.contains("Notifications arrived too quickly"))
+            resumeDelivery.complete(Unit)
+            val after = withTimeout(5_000) { replayAfter.await() }
+            assertTrue(after in 2L..eventCount.toLong())
+            withTimeout(5_000) {
+                while (delivered.size < eventCount) delay(10)
+                connection.approvals.first { !it.isNullOrEmpty() }
+            }
+            assertEquals((2L..(eventCount + 1L)).toList(), delivered.toList())
+            assertEquals("r1", connection.approvals.value!!.single().id)
+        } finally {
+            resumeDelivery.complete(Unit)
+            connection.stop()
+        }
     }
 
     private fun relayWithApproval(relaySocket: CompletableDeferred<WebSocket>) = object : WebSocketListener() {

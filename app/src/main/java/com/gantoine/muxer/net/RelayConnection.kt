@@ -51,6 +51,7 @@ import com.gantoine.muxer.protocol.WorkspacesMessage
 import com.gantoine.muxer.terminal.TerminalModel
 import com.gantoine.muxer.terminal.TerminalScreen
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -158,7 +159,12 @@ class RelayConnection(
     private val pending = ConcurrentHashMap<String, CompletableDeferred<Result<JsonElement?>>>()
     private val nextId = AtomicLong()
     private val nextAttachmentId = AtomicLong()
-    private val notifications = Channel<RelayNotification>(Channel.UNLIMITED)
+    private data class QueuedNotification(val notification: RelayNotification, val chars: Int)
+    private val notificationChars = AtomicInteger()
+    private val notifications = Channel<QueuedNotification>(
+        capacity = MAX_QUEUED_NOTIFICATIONS,
+        onUndeliveredElement = { notificationChars.addAndGet(-it.chars) },
+    )
     @Volatile private var socket: WebSocket? = null
     private var loop: Job? = null
     @Volatile private var attachment: Attachment? = null
@@ -172,7 +178,15 @@ class RelayConnection(
     fun start() {
         if (loop?.isActive == true) return
         loop = scope.launch {
-            val delivery = launch { for (notification in notifications) onNotification(macId, notification) }
+            val delivery = launch {
+                for (queued in notifications) {
+                    try {
+                        onNotification(macId, queued.notification)
+                    } finally {
+                        notificationChars.addAndGet(-queued.chars)
+                    }
+                }
+            }
             try {
                 runLoop()
             } finally {
@@ -243,8 +257,14 @@ class RelayConnection(
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+            if (closed.isCompleted) return
             try {
-                handleMessage(text)
+                handleMessage(text) {
+                    // Do not accept later sequence numbers after rejecting one.
+                    // The next hello resumes from the persisted delivery cursor.
+                    closed.complete(CloseReason("Notifications arrived too quickly. Reconnecting.", wasConnected = welcomed))
+                    webSocket.cancel()
+                }
             } catch (_: SerializationException) {
             }
         }
@@ -284,7 +304,7 @@ class RelayConnection(
         }
     }
 
-    private fun handleMessage(text: String) {
+    private fun handleMessage(text: String, onNotificationOverflow: () -> Unit) {
         val message = runCatching { RelayJson.parseToJsonElement(text).jsonObject }.getOrNull() ?: return
         when (message["type"]?.jsonPrimitive?.contentOrNull) {
             "result" -> completeRequest(message)
@@ -335,8 +355,20 @@ class RelayConnection(
                 if (state.surfaceId == attachment?.surfaceId) _inputState.value = state
             }
             "keep_awake" -> _keepAwake.value = message.decode<KeepAwakeMessage>().enabled
-            "notification" -> notifications.trySend(message.decode<NotificationMessage>().notification)
+            "notification" -> if (!queueNotification(message, text.length)) onNotificationOverflow()
         }
+    }
+
+    private fun queueNotification(message: JsonObject, chars: Int): Boolean {
+        if (chars > MAX_NOTIFICATION_CHARS) return false
+        val notification = message.decode<NotificationMessage>().notification
+        if (notificationChars.addAndGet(chars) > MAX_NOTIFICATION_CHARS) {
+            notificationChars.addAndGet(-chars)
+            return false
+        }
+        if (notifications.trySend(QueuedNotification(notification, chars)).isSuccess) return true
+        notificationChars.addAndGet(-chars)
+        return false
     }
 
     private fun completeRequest(message: JsonObject) {
@@ -789,6 +821,9 @@ class RelayConnection(
     }
 
     private companion object {
+        // The relay replays up to 100 events; the character budget includes active delivery.
+        const val MAX_QUEUED_NOTIFICATIONS = 128
+        const val MAX_NOTIFICATION_CHARS = 512 * 1024
         const val REQUEST_TIMEOUT_MS = 20_000L
         const val HISTORY_LINES = 2_000
     }
