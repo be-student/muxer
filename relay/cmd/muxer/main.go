@@ -135,11 +135,7 @@ func runServe(args []string) error {
 	relay := server.New(client, store, hub, server.Options{MacName: macName, FallbackMacName: defaultMacName(), RelayVersion: version, Approvals: approvalTracker, Agents: agentTracker, HostUsage: host.Sample, InstalledAgents: agentFinder.Installed, LoginShell: host.LoginShell(), Tailnet: tailnet.CLI{}, Listeners: host.Listeners, ListeningProcesses: host.ListeningProcesses, ParentProcesses: host.ParentProcesses, ExposedPorts: paths.exposedPorts, RelayPort: relayPort(listen)}, logger)
 	categories := slices.Concat([]string{"notification"}, agents.EventCategories, server.WorkspaceEventCategories)
 	go events.NewStream(client, logger, cmux.EventFilter{Categories: categories}, hub, approvalTracker, agentTracker, relay).Run(ctx)
-	httpServer := &http.Server{
-		Addr:              listen,
-		Handler:           relay.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	httpServer := newHTTPServer(listen, relay.Handler())
 	logger.Info("relay listening", "address", listener.Addr().String(), "cmux_socket", client.SocketPath(), "version", version)
 	go func() {
 		<-ctx.Done()
@@ -159,6 +155,17 @@ func runServe(args []string) error {
 		return err
 	default:
 		return nil
+	}
+}
+
+func newHTTPServer(address string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              address,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		// Bound request bodies and unread tails. net/http clears the deadline
+		// when a WebSocket takes ownership of the connection through Hijack.
+		ReadTimeout: 10 * time.Second,
 	}
 }
 

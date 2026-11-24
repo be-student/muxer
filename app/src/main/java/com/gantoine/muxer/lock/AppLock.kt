@@ -50,6 +50,13 @@ class AppLock(private val now: () -> Long) {
         lockedState.value = false
     }
 
+    /** Returns whether authentication was requested; only its success callback unlocks. */
+    fun requestUnlock(canAuthenticate: Boolean, authenticate: (() -> Unit) -> Unit): Boolean {
+        if (!canAuthenticate) return false
+        authenticate(::unlock)
+        return true
+    }
+
     suspend fun blocksActions(deviceLocked: Boolean): Boolean = deviceLocked && current.filterNotNull().first().enabled
 
     companion object {

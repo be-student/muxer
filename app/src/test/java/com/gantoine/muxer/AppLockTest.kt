@@ -37,6 +37,45 @@ class AppLockTest {
     }
 
     @Test
+    fun unavailableAuthenticationKeepsTheAppLocked() {
+        lock.apply(LockSettings(enabled = true))
+        var authenticationRequested = false
+
+        assertFalse(lock.requestUnlock(canAuthenticate = false) {
+            authenticationRequested = true
+            it()
+        })
+
+        assertFalse(authenticationRequested)
+        assertEquals(true, lock.locked.value)
+    }
+
+    @Test
+    fun requestingAuthenticationDoesNotUnlockUntilItSucceeds() {
+        lock.apply(LockSettings(enabled = true))
+        var onSuccess: (() -> Unit)? = null
+
+        assertTrue(lock.requestUnlock(canAuthenticate = true) { onSuccess = it })
+        assertEquals(true, lock.locked.value)
+
+        requireNotNull(onSuccess).invoke()
+        assertEquals(false, lock.locked.value)
+    }
+
+    @Test
+    fun authenticationCanBeRetriedAfterBecomingAvailable() {
+        lock.apply(LockSettings(enabled = true))
+        assertFalse(lock.requestUnlock(canAuthenticate = false) { it() })
+        assertEquals(true, lock.locked.value)
+
+        var onSuccess: (() -> Unit)? = null
+        assertTrue(lock.requestUnlock(canAuthenticate = true) { onSuccess = it })
+        assertEquals(true, lock.locked.value)
+        requireNotNull(onSuccess).invoke()
+        assertEquals(false, lock.locked.value)
+    }
+
+    @Test
     fun staysOpenOnColdStartWhenOff() {
         lock.apply(LockSettings(enabled = false))
         assertEquals(false, lock.locked.value)
