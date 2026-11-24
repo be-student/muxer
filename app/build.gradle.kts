@@ -54,6 +54,9 @@ composeCompiler {
 
 dependencies {
     constraints {
+        implementation(libs.okio) {
+            because("Okio 3.18.2 fixes the Base64 padding regression in 3.18.1.")
+        }
         libs.bundles.patched.build.tooling.get().forEach { add("androidLintTool", it) }
     }
     implementation(libs.androidx.core.ktx)

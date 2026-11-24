@@ -16,7 +16,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -41,14 +44,16 @@ fun LockGate(app: MuxerApplication, content: @Composable () -> Unit) {
 private fun LockScreen(app: MuxerApplication) {
     val activity = LocalActivity.current as? FragmentActivity
     val lifecycle = LocalLifecycleOwner.current.lifecycle
+    var authenticationUnavailable by remember { mutableStateOf(false) }
 
     fun unlock() {
-        if (activity == null) return
-        if (!DeviceAuth.canAuthenticate(activity)) {
-            app.lock.unlock()
+        if (activity == null) {
+            authenticationUnavailable = true
             return
         }
-        DeviceAuth.authenticate(activity, title = "Unlock Muxer", onSuccess = app.lock::unlock)
+        authenticationUnavailable = !app.lock.requestUnlock(DeviceAuth.canAuthenticate(activity)) { onSuccess ->
+            DeviceAuth.authenticate(activity, title = "Unlock Muxer", onSuccess = onSuccess)
+        }
     }
 
     LaunchedEffect(Unit) { lifecycle.withResumed { unlock() } }
@@ -57,9 +62,13 @@ private fun LockScreen(app: MuxerApplication) {
         EmptyState(
             icon = Icons.Outlined.Lock,
             title = "Muxer is locked",
-            body = "Unlock to see your terminals.",
+            body = if (authenticationUnavailable) {
+                "Device authentication is unavailable. Muxer will stay locked. Check your phone's screen lock settings and try again."
+            } else {
+                "Unlock to see your terminals."
+            },
         ) {
-            Button(onClick = ::unlock) { Text("Unlock") }
+            Button(onClick = ::unlock) { Text(if (authenticationUnavailable) "Try again" else "Unlock") }
         }
     }
 }
