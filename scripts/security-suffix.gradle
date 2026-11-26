@@ -1,0 +1,11 @@
+// Personal build: installs as com.gantoine.muxer.security, the package already paired on the owner's phone.
+// Without this suffix the APK installs as a separate app with no pairing.
+// Usage (from the repo root; bump both numbers above the installed build):
+//   gradle-run -I scripts/security-suffix.gradle -PversionName=0.8.0-security.N -PversionCode=800N :app:assembleRelease
+// Then sign app/build/outputs/apk/release/app-release-unsigned.apk with the personal signer
+// (Bitwarden key MUXER_SECURITY__ANDROID_SIGNING_PKCS12, alias muxer-security) and install with adb install -r.
+allprojects {
+  plugins.withId("com.android.application") {
+    android.defaultConfig.applicationIdSuffix = ".security"
+  }
+}
