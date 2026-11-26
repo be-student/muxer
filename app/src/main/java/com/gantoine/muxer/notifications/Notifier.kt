@@ -44,21 +44,22 @@ class Notifier(
         val manager = context.getSystemService(NotificationManager::class.java)
         manager.createNotificationChannels(
             listOf(
-                channel(APPROVALS_CHANNEL, R.string.channel_approvals, R.string.channel_approvals_description, NotificationManager.IMPORTANCE_HIGH),
-                channel(COMPLETIONS_CHANNEL, R.string.channel_completions, R.string.channel_completions_description, NotificationManager.IMPORTANCE_HIGH),
-                channel(ALERTS_CHANNEL, R.string.channel_alerts, R.string.channel_alerts_description, NotificationManager.IMPORTANCE_HIGH),
+                // Only approvals badge the launcher icon, so its count is the number of sessions waiting on you.
+                channel(APPROVALS_CHANNEL, R.string.channel_approvals, R.string.channel_approvals_description, NotificationManager.IMPORTANCE_HIGH, showBadge = true),
+                channel(COMPLETIONS_CHANNEL, R.string.channel_completions, R.string.channel_completions_description, NotificationManager.IMPORTANCE_HIGH, showBadge = false),
+                channel(ALERTS_CHANNEL, R.string.channel_alerts, R.string.channel_alerts_description, NotificationManager.IMPORTANCE_HIGH, showBadge = false),
+                channel(ACTIVITY_CHANNEL, R.string.channel_activity, R.string.channel_activity_description, NotificationManager.IMPORTANCE_LOW, showBadge = false),
             ),
         )
-        manager.deleteNotificationChannel(LEGACY_AGENT_CHANNEL)
-        manager.createNotificationChannel(
-            NotificationChannel(ACTIVITY_CHANNEL, context.getString(R.string.channel_activity), NotificationManager.IMPORTANCE_LOW)
-                .apply { description = context.getString(R.string.channel_activity_description) },
-        )
-        manager.deleteNotificationChannel(LEGACY_CONNECTION_CHANNEL)
+        // A channel's badge setting is fixed once created, so the non-badging channels got new ids.
+        LEGACY_CHANNELS.forEach(manager::deleteNotificationChannel)
     }
 
-    private fun channel(id: String, name: Int, description: Int, importance: Int) =
-        NotificationChannel(id, context.getString(name), importance).apply { this.description = context.getString(description) }
+    private fun channel(id: String, name: Int, description: Int, importance: Int, showBadge: Boolean) =
+        NotificationChannel(id, context.getString(name), importance).apply {
+            this.description = context.getString(description)
+            setShowBadge(showBadge)
+        }
 
     fun canNotify(): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
@@ -301,11 +302,10 @@ class Notifier(
 
     companion object {
         const val APPROVALS_CHANNEL = "approvals"
-        const val COMPLETIONS_CHANNEL = "completions"
-        const val ALERTS_CHANNEL = "alerts"
-        private const val LEGACY_AGENT_CHANNEL = "agents"
-        const val ACTIVITY_CHANNEL = "activity"
-        private const val LEGACY_CONNECTION_CHANNEL = "connection"
+        const val COMPLETIONS_CHANNEL = "completions-quiet"
+        const val ALERTS_CHANNEL = "alerts-quiet"
+        const val ACTIVITY_CHANNEL = "activity-quiet"
+        private val LEGACY_CHANNELS = listOf("agents", "connection", "completions", "alerts", "activity")
         const val ACTION_OPEN_TERMINAL = "com.gantoine.muxer.OPEN_TERMINAL"
         const val EXTRA_MAC_ID = "mac_id"
         const val EXTRA_WORKSPACE_ID = "workspace_id"
